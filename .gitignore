@@ -1,0 +1,10 @@
+/target
+learning-concepts/**/target
+
+# macOS
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+*.swp
