@@ -1,6 +1,11 @@
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 #[derive(Parser)]
 struct Cli {
@@ -25,27 +30,36 @@ async fn main() -> io::Result<()> {
                 .await
                 .unwrap();
 
-            loop {
-                let (socket, addr) = listener.accept().await.unwrap();
-                println!("New connection: {}", addr);
+            let peers = Arc::new(Mutex::new(HashMap::<SocketAddr, OwnedWriteHalf>::new()));
+            let peer_list = peers.clone();
 
-                let (rd, mut wr) = io::split(socket);
+            tokio::spawn(async move {
+                loop {
+                    let (socket, addr) = listener.accept().await.unwrap();
+                    println!("New connection: {}", addr);
 
-                // read from socket, print to terminal
-                tokio::spawn(async move {
-                    let rd = BufReader::new(rd);
-                    let mut lines = rd.lines();
-
-                    while let Some(line) = lines.next_line().await.unwrap() {
-                        println!("{}: {}", addr, line);
+                    let (rd, wr) = socket.into_split();
+                    {
+                        peer_list.lock().await.insert(addr, wr);
                     }
-                });
 
-                // read from stdin, send over socket
-                let stdin = BufReader::new(io::stdin());
-                let mut lines = stdin.lines();
+                    tokio::spawn(async move {
+                        let rd = BufReader::new(rd);
+                        let mut lines = rd.lines();
 
-                while let Some(line) = lines.next_line().await.unwrap() {
+                        while let Some(line) = lines.next_line().await.unwrap() {
+                            println!("{}: {}", addr, line);
+                        }
+                    });
+                }
+            });
+
+            let stdin = BufReader::new(io::stdin());
+            let mut lines = stdin.lines();
+
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let mut peer_list = peers.lock().await;
+                for (_, wr) in peer_list.iter_mut() {
                     wr.write_all(line.as_bytes()).await.unwrap();
                     wr.write_all(b"\n").await.unwrap();
                 }
@@ -58,7 +72,6 @@ async fn main() -> io::Result<()> {
             let socket = TcpStream::connect(address).await?;
             let (rd, mut wr) = io::split(socket);
 
-            // read from socket, print to terminal
             tokio::spawn(async move {
                 let rd = BufReader::new(rd);
                 let mut incoming = rd.lines();
@@ -68,7 +81,6 @@ async fn main() -> io::Result<()> {
                 }
             });
 
-            // read from stdin, send over socket
             let stdin = BufReader::new(io::stdin());
             let mut lines = stdin.lines();
 
