@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
+libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "mdns", "gossipsub", "tokio", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3.30"

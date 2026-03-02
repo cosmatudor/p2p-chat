@@ -1,165 +1,108 @@
-use clap::{Parser, Subcommand};
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
-#[derive(Parser)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+use std::{
+    collections::hash_map::DefaultHasher,
+    error::Error,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
 
-#[derive(Subcommand)]
-enum Command {
-    Start {
-        #[arg(long)]
-        port: u16,
-        #[arg(long)]
-        peer: Option<String>,
-    },
+use futures::stream::StreamExt;
+use libp2p::{
+    gossipsub, mdns, noise,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
+};
+use tokio::{io, io::AsyncBufReadExt, select};
+use tracing_subscriber::EnvFilter;
+
+#[derive(NetworkBehaviour)]
+struct MyBehaviour {
+    gossipsub: gossipsub::Behaviour,
+    mdns: mdns::tokio::Behaviour,
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
-    let cli = Cli::parse();
+async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
 
-    let peers = Arc::new(Mutex::new(HashMap::<SocketAddr, OwnedWriteHalf>::new()));
+    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            let message_id_fn = |message: &gossipsub::Message| {
+                let mut s = DefaultHasher::new();
+                message.data.hash(&mut s);
+                gossipsub::MessageId::from(s.finish().to_string())
+            };
 
-    match cli.command {
-        Command::Start { port, peer } => {
-            // --- LISTENING FOR NEW PEERS ---
-            println!("listening on port {}", port);
-            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .message_id_fn(message_id_fn)
+                .build()
+                .map_err(io::Error::other)?;
 
-            let peer_list = peers.clone();
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
 
-            tokio::spawn(async move {
-                loop {
-                    let (socket, addr) = listener.accept().await.unwrap();
-                    println!("New connection: {}", addr);
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+            Ok(MyBehaviour { gossipsub, mdns })
+        })?
+        .build();
 
-                    let (rd, mut wr) = socket.into_split();
+    let topic = gossipsub::IdentTopic::new("test-net");
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-                    // send peer list before adding new peer
-                    let handshake_msg = compute_handshake_msg(&peer_list).await;
-                    wr.write_all(handshake_msg.as_bytes()).await.unwrap();
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
 
-                    // read hello to get their real listening port
-                    let mut reader = BufReader::new(rd);
-                    let mut hello = String::new();
-                    reader.read_line(&mut hello).await.unwrap();
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-                    let real_addr: SocketAddr = if hello.starts_with("[hello]:") {
-                        let listen_port: u16 = hello["[hello]:".len()..].trim().parse().unwrap();
-                        format!("{}:{}", addr.ip(), listen_port).parse().unwrap()
-                    } else {
-                        addr
-                    };
+    println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
 
-                    peer_list.lock().await.insert(real_addr, wr);
-
-                    tokio::spawn(async move {
-                        let mut lines = reader.lines();
-
-                        while let Some(line) = lines.next_line().await.unwrap() {
-                            println!("{}: {}", real_addr, line);
-                        }
-                    });
+    loop {
+        select! {
+            Ok(Some(line)) = stdin.next_line() => {
+                if let Err(e) = swarm
+                    .behaviour_mut().gossipsub
+                    .publish(topic.clone(), line.as_bytes()) {
+                    println!("Publish error: {e:?}");
                 }
-            });
-
-            let peer_list = peers.clone();
-
-            // --- DIALING TO NEW PEERS ---
-            if let Some(address) = peer {
-                let peer_addr = address.clone();
-                let Ok((rd, mut wr)) = connect_to_peer(peer_addr.to_string()).await else {
-                    eprintln!("failed to connect to peer {}", address);
-                    return Ok(());
-                };
-
-                // send our listening port
-                wr.write_all(format!("[hello]:{}\n", port).as_bytes()).await.unwrap();
-
-                // read peer list synchronously before starting stdin
-                let mut reader = BufReader::new(rd);
-                let mut peer_list_msg = String::new();
-                reader.read_line(&mut peer_list_msg).await.unwrap();
-
-                // insert the peer we dialed
-                peer_list.lock().await.insert(peer_addr.parse().unwrap(), wr);
-
-                // connect to all peers we learned about
-                let content = peer_list_msg.trim_start_matches("[peer_list]:").trim().to_string();
-                if !content.is_empty() {
-                    for addr in content.split(',') {
-                        let addr = addr.to_string();
-                        let Ok((rd, mut wr)) = connect_to_peer(addr.clone()).await else {
-                            eprintln!("failed to connect to peer {}", addr);
-                            continue;
-                        };
-
-                        // send hello so the peer knows our real port
-                        wr.write_all(format!("[hello]:{}\n", port).as_bytes()).await.unwrap();
-
-                        // consume their peer list response (we already know all peers)
-                        let mut discovered_reader = BufReader::new(rd);
-                        let mut _discard = String::new();
-                        discovered_reader.read_line(&mut _discard).await.unwrap();
-
-                        peer_list.lock().await.insert(addr.parse().unwrap(), wr);
-
-                        // spawn reader for ongoing messages
-                        let addr_clone = addr.clone();
-                        tokio::spawn(async move {
-                            let mut lines = discovered_reader.lines();
-                            while let Some(line) = lines.next_line().await.unwrap() {
-                                println!("{}: {}", addr_clone, line);
-                            }
-                        });
-                    }
-                }
-
-                // spawn reader for ongoing messages
-                tokio::spawn(async move {
-                    let mut lines = reader.lines();
-                    while let Some(line) = lines.next_line().await.unwrap() {
-                        println!("{}: {}", peer_addr, line);
-                    }
-                });
             }
-
-            // --- READ MESSAGES FROM TERMINAL AND SEND TO PEERS ---
-            let stdin = BufReader::new(io::stdin());
-            let mut lines = stdin.lines();
-
-            while let Some(line) = lines.next_line().await.unwrap() {
-                let mut peer_list = peers.lock().await;
-                for (_, wr) in peer_list.iter_mut() {
-                    wr.write_all(line.as_bytes()).await.unwrap();
-                    wr.write_all(b"\n").await.unwrap();
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        println!("mDNS discovered a new peer: {peer_id}");
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
+                },
+                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        println!("mDNS discover peer has expired: {peer_id}");
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    }
+                },
+                SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source: peer_id,
+                    message_id: id,
+                    message,
+                })) => println!(
+                        "Got message: '{}' with id: {id} from peer: {peer_id}",
+                        String::from_utf8_lossy(&message.data),
+                    ),
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Local node is listening on {address}");
                 }
+                _ => {}
             }
         }
     }
-
-    Ok(())
-}
-
-async fn compute_handshake_msg(peers: &Mutex<HashMap<SocketAddr, OwnedWriteHalf>>) -> String {
-    let peer_list = peers.lock().await;
-    let addrs: Vec<String> = peer_list.keys().map(|a| a.to_string()).collect();
-    format!("[peer_list]:{}\n", addrs.join(","))
-}
-
-async fn connect_to_peer(address: String) -> io::Result<(OwnedReadHalf, OwnedWriteHalf)> {
-    println!("dialing {}", address);
-    let socket = TcpStream::connect(address).await?;
-    Ok(socket.into_split())
 }
